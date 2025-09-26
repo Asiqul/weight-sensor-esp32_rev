@@ -9,7 +9,8 @@
 #include <splash.h>
 
 /* TASKS HANDLER DEFINITION */
-TaskHandle_t MachineController;
+TaskHandle_t DisplayController;
+TaskHandle_t AlarmController;
 /* TASKS HANDLER DEFINITION END */
 
 /* DEFINING HX711 PINS */
@@ -18,10 +19,10 @@ TaskHandle_t MachineController;
 HX711 scale;
 /* DEFINING HX711 PINS END */
 
-/* RELAY and LIMIT SWITCH PINS */
+/* RELAY PINS */
+#define BUZZER_PIN 5
 #define RELAY_PIN 23
-#define LIMIT_SWITCH_PIN 5
-/* RELAY and LIMIT SWITCH PINS END */
+/* RELAY PINS END */
 
 /* OLED DISPLAY PARAMETERS */
 #define SCREEN_WIDTH 128
@@ -31,7 +32,9 @@ HX711 scale;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 /* OLED DISPLAY PARAMETERS END */
 
-/* KEYPAD SETUP */
+/*
+
+ gKEYPAD SETUP */
 const byte ROWS = 4;
 const byte COLS = 4;
 char hexaKeys[ROWS][COLS] = {
@@ -46,41 +49,38 @@ Keypad customKeypad = Keypad(makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS)
 /* KEYPAD SETUP END */
 
 /* GLOBAL PARAMETERS */
-float calibration_factor;
+float calibration_factor = 5005;
 long zero_offset = 0;
 float weight;
-bool machine_state = false;
 bool isTare = false;
-bool isCalibrate = false;
-bool calMode = false;
-bool isReady = false;
-String calStatus = "Not OK";
+bool setLimMode = false;
+bool setCalMode = false;
+bool Start = false;
+bool relayRun = false;
+int16_t relayDelay = 0;
+float limitSet = 0.0;
 String tareStatus = "Not OK";
 /* GLOBAL PARAMETERS END */
 
 /* FUNCTION DEFINITION */
 void keypadEvent(KeypadEvent key);
-void MachineControllerTask(void *pvParameters);
 void DisplayText(int x, int y, int size, String text);
+void DisplayControllerTask(void *pvParameters);
+void AlarmControllerTask(void *pvParameters);
 /* FUNCTION DEFINITION END*/
 
 void setup()
 {
   Serial.begin(115200);
-  EEPROM.begin(2);
+  EEPROM.begin(10);
 
-  calibration_factor = EEPROM.readFloat(1);
-  if (calibration_factor == 0)
-  {
-    calibration_factor = -500;
-    EEPROM.put(1, calibration_factor);
-  }
+  limitSet = EEPROM.readFloat(4);
+  relayDelay = EEPROM.read(3) * 100;
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
   {
     Serial.println(F("SSD1306 allocation failed"));
-    for (;;)
-      ;
+    for (;;);
   }
 
   // Splash Screen Display
@@ -90,68 +90,57 @@ void setup()
 
   // HX711 Setup
   scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
-  scale.set_scale(calibration_factor);
+  scale.set_scale(calibration_factor); // Set the calibration factor
   scale.tare();
-
-  // Relay and Limit Switch Setup
-  pinMode(RELAY_PIN, OUTPUT_OPEN_DRAIN);
-  digitalWrite(RELAY_PIN, HIGH);
-  pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
-  delay(2000);
-
+  delay(3000);
   display.clearDisplay();
 
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT_OPEN_DRAIN);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RELAY_PIN, HIGH);
+
+  // Task Creation
+        xTaskCreatePinnedToCore(
+            DisplayControllerTask,
+            "DisplayController",
+            10000,
+            NULL,
+            2,
+            &DisplayController,
+            1);
+
+        xTaskCreatePinnedToCore(
+            AlarmControllerTask,
+            "AlarmController",
+            5000,
+            NULL,
+            1,
+            &AlarmController,
+            0);
+  // Task Creation End
+
+  delay(1000);
   customKeypad.addEventListener(keypadEvent);
 }
 
 void loop()
 {
-  if (!machine_state)
-  {
-    display.clearDisplay();
-    while (!isReady)
-    {
-      char input = customKeypad.getKey();
-
-      DisplayText(16, 0, 1, String("CALIBRATE FIRST!"));
-      DisplayText(10, 19, 1, String("Tare : " + tareStatus));
-      DisplayText(10, 29, 1, String("Cal : " + calStatus));
-      DisplayText(0, 46, 1, String("Hold * to Tare!"));
-      DisplayText(0, 56, 1, String("Hold # to Calibrate!"));
-
-      if (isTare && isCalibrate && !calMode)
-      {
-        delay(1500);
-        isReady = true;
-        display.clearDisplay();
-
-        // Task Creation
-        xTaskCreatePinnedToCore(
-            MachineControllerTask,
-            "MachineController",
-            10000,
-            NULL,
-            1,
-            &MachineController,
-            0);
-        // Task Creation End
-        break;
-      };
+    // Monitoring: print minimum free stack every 5s (useful for debugging)
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 5000) {
+    lastCheck = millis();
+    if (DisplayController) {
+      Serial.print("DisplayTask min free stack: ");
+      Serial.println(uxTaskGetStackHighWaterMark(DisplayController));
+    }
+    if (AlarmController) {
+      Serial.print("AlarmTask min free stack: ");
+      Serial.println(uxTaskGetStackHighWaterMark(AlarmController));
     }
   }
-  else
-  {
-    display.clearDisplay();
-    DisplayText(17, 0, 1, String("Measured Weight"));
-    DisplayText(50, 50, 1, String("grams"));
-
-    display.clearDisplay();
-    display.setCursor(20, 25);
-    display.setTextSize(2);
-    display.setTextColor(SSD1306_WHITE);
-    display.println(String(weight));
-    display.display();
-  }
+  // Do nothing else in main loop: FreeRTOS tasks handle behavior
+  vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 void keypadEvent(KeypadEvent key)
@@ -159,63 +148,120 @@ void keypadEvent(KeypadEvent key)
   switch (customKeypad.getState())
   {
   case HOLD:
-    if (key == '*')
+    if (key == 'A')
     {
       display.clearDisplay();
+      vTaskSuspend(AlarmController);
       isTare = true;
       tareStatus = "OK";
       zero_offset = scale.read_average(15);
       scale.set_offset(zero_offset);
-      DisplayText(5, 25, 2, String("Tare Done!"));
+      scale.tare();
+      DisplayText(5, 25, 2, String(F("Tare Done!")));
       delay(2000);
       display.clearDisplay();
+      vTaskResume(AlarmController);
     }
-    else if (key == '#')
+    else if (key == 'C')
     {
-      String newFactor = "";
-      calMode = true;
+      String newLimit = "";
+      setLimMode = true;
       display.clearDisplay();
-      while (calMode)
+      while (setLimMode)
       {
         char input = customKeypad.getKey();
-        DisplayText(10, 0, 1, String("Calibration Factor:"));
-        DisplayText(0, 55, 1, String("A.save, D.del, C.cancel"));
-        if (input == '0' || input == '1' || input == '2' || input == '3' || input == '4' || input == '5' || input == '6' || input == '7' || input == '8' || input == '9' && newFactor.length() <= 5)
+        DisplayText(22, 0, 1, String(F("SET LIMIT MAX")));
+        DisplayText(0, 55, 1, String(F("A.save, D.del, C.cancel")));
+        if (input == '0' || input == '1' || input == '2' || input == '3' || input == '4' || input == '5' || input == '6' || input == '7' || input == '8' || input == '9' && newLimit.length() <= 5)
         {
-          newFactor += input;
-          DisplayText(29, 25, 2, String(newFactor));
+          newLimit += input;
+          DisplayText(29, 25, 2, String(newLimit));
         }
         else if (input == 'A')
         {
-          calibration_factor = newFactor.toFloat();
-          EEPROM.writeFloat(1, calibration_factor);
-          calMode = false;
-          isCalibrate = true;
-          calStatus = "OK";
+          limitSet = newLimit.toFloat();
+          EEPROM.put(4, limitSet);
+          EEPROM.commit();
+          setLimMode = false;
+          limitSet = EEPROM.readFloat(4);
           display.clearDisplay();
-          DisplayText(30, 25, 2, String("SAVED!"));
+          DisplayText(30, 25, 2, String(F("SAVED!")));
           delay(2000);
-          Serial.println(EEPROM.readFloat(1));
           display.clearDisplay();
         }
         else if (input == 'D')
         {
-          newFactor = "";
+          newLimit = "";
           display.clearDisplay();
-          DisplayText(0, 10, 2, String(newFactor));
+          DisplayText(0, 10, 2, String(newLimit));
         }
         else if (input == 'C')
         {
-          calMode = false;
+          setLimMode = false;
           display.clearDisplay();
-          DisplayText(20, 25, 2, String("CANCELED!"));
+          DisplayText(20, 25, 2, String(F("CANCELED!")));
+          delay(2000);
+          display.clearDisplay();
+        }
+      }
+    } else if (key == 'B')
+    {
+      Start = true;
+      display.clearDisplay();
+    } else if (key == 'D') {
+      String newCalculation = "";
+      setCalMode = true;
+      display.clearDisplay();
+      while (setCalMode)
+      {
+        char input2 = customKeypad.getKey();
+        DisplayText(17, 0, 1, String(F("SET DELAY RELAY")));
+        DisplayText(0, 55, 1, String(F("A.save, D.del, C.cancel")));
+        if (input2 == '0' || input2 == '1' || input2 == '2' || input2 == '3' || input2 == '4' || input2 == '5' || input2 == '6' || input2 == '7' || input2 == '8' || input2 == '9' && newCalculation.length() <= 5)
+        {
+          newCalculation += input2;
+          DisplayText(29, 25, 2, String(newCalculation));
+        }
+        else if (input2 == 'A')
+        {
+          Serial.print("Delay : ");
+          relayDelay = newCalculation.toInt();
+          EEPROM.write(3, relayDelay);
+          EEPROM.commit();
+          setCalMode = false;
+          Serial.println(relayDelay);
+          display.clearDisplay();
+          DisplayText(30, 25, 2, String(F("SAVED!")));
+          relayDelay = EEPROM.read(3) * 100;
+          Serial.print(F("Relay Delay : "));  //relay delay test
+          Serial.println(relayDelay);
+          delay(2000);
+          display.clearDisplay();
+        }
+        else if (input2 == 'D')
+        {
+          newCalculation = "";
+          display.clearDisplay();
+          DisplayText(0, 10, 2, String(newCalculation));
+        }
+        else if (input2 == 'C')
+        {
+          setCalMode = false;
+          display.clearDisplay();
+          DisplayText(20, 25, 2, String(F("CANCELED!")));
           delay(2000);
           display.clearDisplay();
         }
       }
     }
     delay(2000);
-    break;
+    display.clearDisplay();
+  case PRESSED:
+    if (key == '*') {
+      Start = false;
+      display.clearDisplay();
+    }
+  break;
   }
 }
 
@@ -228,34 +274,53 @@ void DisplayText(int x, int y, int size, String text)
   display.display();
 }
 
-void MachineControllerTask(void *pvParameters)
-{
-  while (true)
-  {
-    if (!machine_state)
-    {
-      if (digitalRead(LIMIT_SWITCH_PIN) == LOW)
-      {
+void DisplayControllerTask(void *pvParameters) {
+  for (;;) {
+    customKeypad.getKey();
+
+    if (!Start) {
+      DisplayText(38, 0, 1, F("MAIN MENU"));
+      DisplayText(30, 19, 1, "Tare : " + tareStatus);
+      DisplayText(25, 29, 1, "Limit : " + String(limitSet) + "Kg");
+      DisplayText(17, 46, 1, F("A.Tare, B.Start"));
+      DisplayText(17, 56, 1, F("C.Set Limit Max"));
+    } else {
+      display.clearDisplay();
+      display.setCursor(10, 0);
+      display.setTextSize(1);
+      display.println(F("CALCULATING WEIGHT"));
+
+      display.setCursor(25, 20);
+      display.setTextSize(3);
+      display.println(weight);
+
+      display.setCursor(55, 55);
+      display.setTextSize(1);
+      display.println(F("Kg"));
+      display.display();
+    }
+    vTaskDelay(pdMS_TO_TICKS(300));  
+  }
+}
+
+void AlarmControllerTask(void *pvParameters) {
+  for (;;) {
+    weight = scale.get_units(4);
+
+    if (weight >= limitSet) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      relayRun = true;
+
+      if (relayRun) {
+        vTaskDelay(pdMS_TO_TICKS(relayDelay));
         digitalWrite(RELAY_PIN, LOW);
-        machine_state = true;
-        Serial.println("Machine Started!");
-      }
-      Serial.println("Limit Switch: " + String(digitalRead(LIMIT_SWITCH_PIN)));
-      Serial.println("Machine State: " + String(machine_state));
-    }
-    else if (machine_state)
-    {
-      // code to measure weight
-      weight = scale.get_units(15);
-      Serial.println("Weight: " + String(weight));
-      if (weight >= 500)
-      {
+        vTaskDelay(pdMS_TO_TICKS(350));
         digitalWrite(RELAY_PIN, HIGH);
-        machine_state = false;
-        Serial.println("Machine Stopped!");
+        relayRun = false;
       }
-      Serial.println("Limit Switch: " + String(digitalRead(LIMIT_SWITCH_PIN)));
+    } else {
+      digitalWrite(BUZZER_PIN, LOW);
     }
-    delay(100);
+    vTaskDelay(pdMS_TO_TICKS(70));  
   }
 }
